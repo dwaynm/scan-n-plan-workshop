@@ -37,7 +37,9 @@ add_library(
   src/plugins/tasks/kinematic_limits_check_profile.cpp
   src/plugins/tasks/kinematic_limits_check_task.cpp
   src/plugins/tasks/tcp_speed_limiter_profile.cpp
-  src/plugins/tasks/tcp_speed_limiter_task.cpp)
+  src/plugins/tasks/tcp_speed_limiter_task.cpp
+  src/level_axis_profile.cpp
+  src/plugins/tasks/nozzle_planning_tasks.cpp)
 target_link_libraries(
   ${PROJECT_NAME}_tasks
   tesseract::tesseract_common
@@ -47,10 +49,13 @@ target_link_libraries(
   tesseract::tesseract_time_parameterization_core
   tesseract::tesseract_environment
   tesseract::tesseract_motion_planners_core
+  tesseract::tesseract_motion_planners_descartes
+  tesseract::tesseract_motion_planners_trajopt
+  tesseract::tesseract_task_composer_planning_nodes
   yaml-cpp)
 
 # Planning server
-add_executable(${PROJECT_NAME}_node src/planning_server.cpp src/level_axis_profile.cpp)
+add_executable(${PROJECT_NAME}_node src/planning_server.cpp)
 ament_target_dependencies(${PROJECT_NAME}_node ${ROS2_DEPS})
 target_link_libraries(
   ${PROJECT_NAME}_node

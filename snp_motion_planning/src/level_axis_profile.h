@@ -1,63 +1,24 @@
 #pragma once
 
 /**
- * The two things this cell asks of Descartes that stock Descartes does not do.
- *
- * ONE: prefer arm configurations that keep a tool axis horizontal.
- * TWO: refuse to change arm configuration between two adjacent waypoints.
- *
- * Both live on one profile class because Descartes takes exactly one plan
- * profile per move instruction, so there is one slot to put them in.
- *
- * --- ONE ---------------------------------------------------------------
- *
- * A centrifugal blast wheel throws media tangentially, so the fan spreads in the
- * plane perpendicular to the wheel's motor axis. Rolling the tool about the blast
- * axis tips that fan over and smears coverage, so the motor axis wants to stay
- * horizontal ("levelled").
- *
- * Descartes samples the roll about the tool's Z at every waypoint and picks the
- * cheapest path through the resulting ladder graph -- but the stock state
- * evaluator returns 0 for every candidate, so all rolls look equally good and the
- * choice is arbitrary. Clamping the sampling range instead is too blunt: where no
- * levelled solution exists the waypoint has NO candidates at all and the whole
- * plan fails. Scoring the states keeps every candidate available while pulling the
- * solution towards level wherever level is actually reachable.
- *
- * This is a preference, not a guarantee. Use snp_motion_planning's
- * `level_axis_weight` parameter to set how strongly it competes with the
- * smoothness cost.
- *
- * --- TWO ---------------------------------------------------------------
- *
- * Descartes scores an edge by joint distance and nothing else. Nothing caps how
- * far a joint may travel between two adjacent states, and edge collision
- * checking is off (`enable_edge_collision = false`) because leaving it on is
- * far too slow. So where two arm configurations both reach a raster line, the
- * cheapest path through the ladder graph is free to step from one to the other
- * between two states 65 mm apart. Both states are collision-free, which is all
- * Descartes ever checks -- the sweep between them is not.
- *
- * TrajOpt, which gets that seed, DOES check between states (LVS_DISCRETE). It
- * then has to remove a 60 deg wrist flip while holding the tool on the line,
- * cannot, and the whole raster fails -- reported to the operator as "out of
- * reach or collides", about a path every waypoint of which is reachable.
- *
- * Measured 2026-08-28 on the sofa back-wall scan, 10 passes, 267 states: 95 %
- * of state-to-state transitions moved every joint less than 10 deg, and 12
- * moved one joint 20-63 deg. All 12 sat in two clusters, in the middle of two
- * blasting passes, and those same states are where TrajOpt's collision and
- * Cartesian constraints were violated from its very first iteration. Probing
- * the same two passes at 15 mm showed a smooth chain existed throughout, with
- * 2-3 IK branches per pose -- so the flip was never necessary, only cheap.
- *
- * `max_joint_step` is the cap, in radians, applied per joint per edge. 0 leaves
- * Descartes exactly as it was.
+ * SNP Descartes profile: bounded joint steps, request-local seed caches,
+ * optional connected seed-joint range, and Cartesian angular recovery.
+ * The legacy horizontal wheel-axis preference remains optional (weight zero
+ * for the nozzle). Recovery keeps original targets and uses only the existing
+ * optimizer tolerances. Selected edges are collision checked by the seed task.
  */
 
 #include <memory>
+#include <map>
+#include <vector>
+#include <cmath>
 #include <string>
 #include <utility>
+#include <mutex>
+#include <boost/uuid/uuid_io.hpp>
+#include <tesseract_common/utils.h>
+#include <tesseract_motion_planners/descartes/descartes_vertex_evaluator.h>
+#include <descartes_light/core/waypoint_sampler.h>
 
 #include <Eigen/Geometry>
 #include <descartes_light/core/edge_evaluator.h>
@@ -125,6 +86,105 @@ private:
   FloatType limit_;
 };
 
+// Per-solve cache: graph construction only reads; validation writes after all
+// graph workers have joined. Never reused across requests/environments.
+using SeedEdgeKey = std::vector<long long>;
+using SeedEdgeCache = std::map<SeedEdgeKey, bool>;
+template <typename DerivedA, typename DerivedB>
+SeedEdgeKey seedEdgeKey(const Eigen::MatrixBase<DerivedA>& a, const Eigen::MatrixBase<DerivedB>& b)
+{
+  SeedEdgeKey key;
+  for (Eigen::Index i = 0; i < a.size(); ++i) key.push_back(std::llround(a[i] * 1e6));
+  for (Eigen::Index i = 0; i < b.size(); ++i) key.push_back(std::llround(b[i] * 1e6));
+  return key;
+}
+template <typename FloatType>
+class CachedSeedEdgeEvaluator : public descartes_light::EdgeEvaluator<FloatType>
+{
+public:
+  explicit CachedSeedEdgeEvaluator(std::shared_ptr<SeedEdgeCache> cache) : cache_(std::move(cache)) {}
+  std::pair<bool, FloatType> evaluate(const descartes_light::State<FloatType>& a,
+                                    const descartes_light::State<FloatType>& b) const override
+  {
+    auto it = cache_->find(seedEdgeKey(a.values, b.values));
+    return {it == cache_->end() || it->second, 0};
+  }
+private:
+  std::shared_ptr<SeedEdgeCache> cache_;
+};
+
+// Memoize IK within one solve only. Repeated graph searches may change edge
+// validity, but their waypoint IK and collision scene are unchanged.
+template <typename FloatType>
+struct SeedSamples
+{
+  std::mutex mutex;
+  bool ready{false};
+  std::vector<descartes_light::StateSample<FloatType>> values;
+};
+template <typename FloatType>
+using SeedSampleCache = std::map<std::string, std::shared_ptr<SeedSamples<FloatType>>>;
+template <typename FloatType>
+class CachedWaypointSampler : public descartes_light::WaypointSampler<FloatType>
+{
+public:
+  CachedWaypointSampler(std::unique_ptr<descartes_light::WaypointSampler<FloatType>> sampler,
+                        std::shared_ptr<SeedSamples<FloatType>> samples)
+    : sampler_(std::move(sampler)), samples_(std::move(samples)) {}
+  std::vector<descartes_light::StateSample<FloatType>> sample() const override
+  {
+    std::lock_guard<std::mutex> lock(samples_->mutex);
+    if (!samples_->ready) { samples_->values = sampler_->sample(); samples_->ready = true; }
+    return samples_->values;
+  }
+private:
+  std::unique_ptr<descartes_light::WaypointSampler<FloatType>> sampler_;
+  std::shared_ptr<SeedSamples<FloatType>> samples_;
+};
+
+// Intersect seed search bounds with physical limits; never change the robot
+// model or widen its range. A workcell may exclude an island disconnected from
+// its home by tool self-collision.
+inline Eigen::MatrixX2d seedJointLimits(const Eigen::MatrixX2d& physical,
+                                      const std::vector<std::string>& names,
+                                      const std::map<std::string, std::pair<double, double>>& bounds)
+{
+  Eigen::MatrixX2d limits = physical;
+  for (const auto& entry : bounds)
+  {
+    const auto it = std::find(names.begin(), names.end(), entry.first);
+    if (it == names.end()) throw std::runtime_error("Unknown seed joint: " + entry.first);
+    const auto i = std::distance(names.begin(), it);
+    limits(i, 0) = std::max(limits(i, 0), entry.second.first);
+    limits(i, 1) = std::min(limits(i, 1), entry.second.second);
+    if (!std::isfinite(entry.second.first) || !std::isfinite(entry.second.second) || limits(i, 0) >= limits(i, 1))
+      throw std::runtime_error("Invalid seed joint bounds: " + entry.first);
+  }
+  return limits;
+}
+
+// Use exactly the optimizer's rotation-vector tolerance. Euler tilts followed
+// by free roll are coupled: testing the Euler angles alone accepts invalid IK.
+inline tesseract_common::VectorIsometry3d sampleNozzleTolerance(
+    const Eigen::Isometry3d& target, const Eigen::Vector2d& tolerance,
+    double resolution, double minimum, double maximum)
+{
+  tesseract_common::VectorIsometry3d poses;
+  for (double rx : {0.0, -tolerance.x(), tolerance.x()})
+    for (double ry : {0.0, -tolerance.y(), tolerance.y()})
+      for (int k = 0; minimum + k * resolution <= maximum + 1e-9; ++k)
+      {
+        Eigen::Isometry3d pose = target;
+        pose.linear() *= (Eigen::AngleAxisd(rx, Eigen::Vector3d::UnitX()) *
+                          Eigen::AngleAxisd(ry, Eigen::Vector3d::UnitY()) *
+                          Eigen::AngleAxisd(minimum + k * resolution, Eigen::Vector3d::UnitZ())).toRotationMatrix();
+        const auto error = tesseract_common::calcTransformError(target, pose);
+        if (std::abs(error[3]) <= tolerance.x() + 1e-9 && std::abs(error[4]) <= tolerance.y() + 1e-9)
+          poses.push_back(pose);
+      }
+  return poses;
+}
+
 /** @brief DescartesDefaultPlanProfile that scores states by how level `level_axis` is. */
 template <typename FloatType>
 class LevelAxisDescartesPlanProfile : public tesseract_planning::DescartesDefaultPlanProfile<FloatType>
@@ -136,6 +196,36 @@ public:
   Eigen::Vector3d level_axis{ 0, 0, 1 };         //!< the axis, in that link's frame
   double level_weight{ 0.0 };                    //!< 0 disables and restores stock behaviour
   double max_joint_step{ 0.0 };                  //!< rad, per joint per edge; 0 disables
+
+  int seed_attempts{3};
+  double retry_spacing{0.015};
+  double retry_roll_resolution{2.5 * M_PI / 180.0};
+  std::map<std::string, std::pair<double, double>> seed_joint_bounds;
+  Eigen::Vector2d angular_tolerance{0.0, 0.0}; // existing Cartesian tolerances, never enlarged
+  bool angular_recovery{false};
+  bool sample_angular_tolerance{false}; // transient recovery phase
+  std::shared_ptr<SeedEdgeCache> edge_cache; // transient; rebuilt per solve
+  std::shared_ptr<SeedSampleCache<FloatType>> sample_cache; // same lifetime as edge_cache
+
+  std::string sampleCacheKey(const tesseract_planning::MoveInstructionPoly& move) const
+  {
+    return boost::uuids::to_string(move.getUUID()) + ":" +
+           std::to_string(this->target_pose_sample_resolution) + ":" +
+           std::to_string(sample_angular_tolerance);
+  }
+
+  std::unique_ptr<descartes_light::WaypointSampler<FloatType>>
+  createWaypointSampler(const tesseract_planning::MoveInstructionPoly& move,
+                        const tesseract_common::ManipulatorInfo& mi,
+                        const std::shared_ptr<const tesseract_environment::Environment>& env) const override
+  {
+    auto sampler = tesseract_planning::DescartesDefaultPlanProfile<FloatType>::createWaypointSampler(move, mi, env);
+    if (!sample_cache) return sampler;
+    const auto key = sampleCacheKey(move);
+    auto& samples = (*sample_cache)[key];
+    if (!samples) samples = std::make_shared<SeedSamples<FloatType>>();
+    return std::make_unique<CachedWaypointSampler<FloatType>>(std::move(sampler), samples);
+  }
 
   std::unique_ptr<descartes_light::StateEvaluator<FloatType>>
   createStateEvaluator(const tesseract_planning::MoveInstructionPoly& move_instruction,
@@ -164,18 +254,43 @@ public:
   {
     auto base = tesseract_planning::DescartesDefaultPlanProfile<FloatType>::createEdgeEvaluator(
         move_instruction, composite_manip_info, env);
-    if (max_joint_step <= 0.0)
+    if (move_instruction.getMoveType() != tesseract_planning::MoveInstructionType::LINEAR)
       return base;
 
     // Compound ANDs validity and sums cost, so the stock evaluator keeps pricing
     // the edge and this one only removes the ones that jump.
     auto compound = std::make_unique<descartes_light::CompoundEdgeEvaluator<FloatType>>();
     compound->evaluators.push_back(std::shared_ptr<descartes_light::EdgeEvaluator<FloatType>>(std::move(base)));
-    compound->evaluators.push_back(std::make_shared<MaxJointStepEdgeEvaluator<FloatType>>(max_joint_step));
+    if (max_joint_step > 0.0)
+      compound->evaluators.push_back(std::make_shared<MaxJointStepEdgeEvaluator<FloatType>>(max_joint_step));
+    if (edge_cache)
+      compound->evaluators.push_back(std::make_shared<CachedSeedEdgeEvaluator<FloatType>>(edge_cache));
     return compound;
   }
 
 protected:
+  std::unique_ptr<tesseract_planning::DescartesVertexEvaluator>
+  createVertexEvaluator(const tesseract_planning::MoveInstructionPoly&,
+                        const std::shared_ptr<const tesseract_kinematics::KinematicGroup>& kin,
+                        const std::shared_ptr<const tesseract_environment::Environment>&) const override
+  {
+    return std::make_unique<tesseract_planning::DescartesJointLimitsVertexEvaluator>(
+        seedJointLimits(kin->getLimits().joint_limits, kin->getJointNames(), seed_joint_bounds));
+  }
+
+  tesseract_planning::PoseSamplerFn createPoseSampler(
+      const tesseract_planning::MoveInstructionPoly& move,
+      const std::shared_ptr<const tesseract_kinematics::KinematicGroup>& kin,
+      const std::shared_ptr<const tesseract_environment::Environment>& env) const override
+  {
+    if (!sample_angular_tolerance)
+      return tesseract_planning::DescartesDefaultPlanProfile<FloatType>::createPoseSampler(move, kin, env);
+    return [tolerance = angular_tolerance, resolution = this->target_pose_sample_resolution,
+            minimum = this->target_pose_sample_min, maximum = this->target_pose_sample_max](const Eigen::Isometry3d& target) {
+      return sampleNozzleTolerance(target, tolerance, resolution, minimum, maximum);
+    };
+  }
+
   // The task composer archives the planning problem, so any profile type it may
   // encounter has to be registered with boost::serialization -- otherwise every
   // plan dies with "unregistered class - derived class not registered".
@@ -188,3 +303,7 @@ protected:
 
 BOOST_CLASS_EXPORT_KEY(snp_motion_planning::LevelAxisDescartesPlanProfile<float>)
 BOOST_CLASS_EXPORT_KEY(snp_motion_planning::LevelAxisDescartesPlanProfile<double>)
+
+#include <boost/serialization/version.hpp>
+BOOST_CLASS_VERSION(snp_motion_planning::LevelAxisDescartesPlanProfile<float>, 2)
+BOOST_CLASS_VERSION(snp_motion_planning::LevelAxisDescartesPlanProfile<double>, 2)

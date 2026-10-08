@@ -56,28 +56,10 @@ createDescartesPlanProfile(FloatType min_contact_distance,
                            const std::string& level_link = "", const Eigen::Vector3d& level_axis = { 0, 0, 1 },
                            double level_weight = 0.0)
 {
-  // Scoring states by how level `level_axis` is makes Descartes PREFER
-  // configurations that keep the blast fan upright, without removing the other
-  // candidates (which clamping the sample range does, and which makes waypoints
-  // with no levelled solution fail outright).
-  //
-  // Only substitute the derived profile when the feature is actually switched
-  // on: it is not registered with boost::serialization, which the task composer
-  // uses when it archives the planning problem, so using it unconditionally
-  // would break every plan ("unregistered class - derived class not registered").
-  typename tesseract_planning::DescartesDefaultPlanProfile<FloatType>::Ptr profile;
-  if (level_weight > 0.0 && !level_link.empty())
-  {
-    auto level_profile = std::make_shared<snp_motion_planning::LevelAxisDescartesPlanProfile<FloatType>>();
-    level_profile->level_link = level_link;
-    level_profile->level_axis = level_axis;
-    level_profile->level_weight = level_weight;
-    profile = level_profile;
-  }
-  else
-  {
-    profile = std::make_shared<tesseract_planning::DescartesDefaultPlanProfile<FloatType>>();
-  }
+  auto profile = std::make_shared<snp_motion_planning::LevelAxisDescartesPlanProfile<FloatType>>();
+  profile->level_link = level_link;
+  profile->level_axis = level_axis;
+  profile->level_weight = level_weight;
   profile->use_redundant_joint_solutions = false;
 
   // Tool pose sampler: how far the tool may roll about its blast axis (+Z).

@@ -322,6 +322,15 @@ public:
     declare_parameter<std::string>(LEVEL_AXIS_LINK_PARAM, "");
     declare_parameter<std::vector<double>>(LEVEL_AXIS_PARAM, { 0.0, 0.0, 1.0 });
     declare_parameter<double>(LEVEL_AXIS_WEIGHT_PARAM, 0.0);
+    declare_parameter<double>("descartes_max_joint_step_deg", 30.0);
+    declare_parameter<int>("descartes_seed_attempts", 3);
+    declare_parameter<double>("descartes_retry_spacing", 0.015);
+    declare_parameter<double>("descartes_retry_roll_resolution_deg", 2.5);
+
+    declare_parameter<bool>("descartes_angular_recovery", false);
+    declare_parameter<std::vector<std::string>>("descartes_seed_joint_names", std::vector<std::string>{});
+    declare_parameter<std::vector<double>>("descartes_seed_joint_lower_deg", std::vector<double>{});
+    declare_parameter<std::vector<double>>("descartes_seed_joint_upper_deg", std::vector<double>{});
 
     // Task composer
     declare_parameter(TASK_COMPOSER_CONFIG_FILE_PARAM, "");
@@ -628,11 +637,30 @@ private:
         throw std::runtime_error(LEVEL_AXIS_PARAM + " must be of size 3, given " +
                                  std::to_string(level_axis_vec.size()));
       Eigen::Vector3d level_axis(level_axis_vec[0], level_axis_vec[1], level_axis_vec[2]);
-      profile_dict->addProfile(DESCARTES_DEFAULT_NAMESPACE, PROFILE,
-                               createDescartesPlanProfile<float>(static_cast<float>(min_contact_dist), collision_pairs,
-                                                                 longest_valid_segment_length, tool_z_range,
-                                                                 tool_z_resolution, level_link, level_axis,
-                                                                 level_weight));
+      auto seed_profile = std::dynamic_pointer_cast<snp_motion_planning::LevelAxisDescartesPlanProfile<float>>(
+          createDescartesPlanProfile<float>(static_cast<float>(min_contact_dist), collision_pairs,
+              longest_valid_segment_length, tool_z_range, tool_z_resolution, level_link, level_axis, level_weight));
+      seed_profile->max_joint_step = get<double>(this, "descartes_max_joint_step_deg") * M_PI / 180.0;
+      seed_profile->seed_attempts = get<int>(this, "descartes_seed_attempts");
+      seed_profile->retry_spacing = get<double>(this, "descartes_retry_spacing");
+      seed_profile->retry_roll_resolution = get<double>(this, "descartes_retry_roll_resolution_deg") * M_PI / 180.0;
+      if (seed_profile->max_joint_step <= 0 || seed_profile->seed_attempts < 1 ||
+          seed_profile->seed_attempts > 10 || seed_profile->retry_spacing <= 0 ||
+          seed_profile->retry_roll_resolution <= 0)
+        throw std::runtime_error("Invalid Descartes seed limits/retry settings");
+      seed_profile->angular_recovery = get<bool>(this, "descartes_angular_recovery");
+      seed_profile->angular_tolerance = Eigen::Vector2d(cart_tolerance[3], cart_tolerance[4]);
+      if (seed_profile->angular_recovery && (seed_profile->angular_tolerance.minCoeff() < 0 ||
+          seed_profile->angular_tolerance.maxCoeff() > 0.1 || !seed_profile->angular_tolerance.allFinite()))
+        throw std::runtime_error("Angular seed recovery requires Cartesian angular tolerances in [0, 0.1] rad");
+      const auto seed_names = get<std::vector<std::string>>(this, "descartes_seed_joint_names");
+      const auto seed_lower = get<std::vector<double>>(this, "descartes_seed_joint_lower_deg");
+      const auto seed_upper = get<std::vector<double>>(this, "descartes_seed_joint_upper_deg");
+      if (seed_names.size() != seed_lower.size() || seed_names.size() != seed_upper.size())
+        throw std::runtime_error("Seed joint names and bounds must have equal lengths");
+      for (std::size_t i = 0; i < seed_names.size(); ++i)
+        seed_profile->seed_joint_bounds[seed_names[i]] = {seed_lower[i]*M_PI/180., seed_upper[i]*M_PI/180.};
+      profile_dict->addProfile(DESCARTES_DEFAULT_NAMESPACE, PROFILE, seed_profile);
       profile_dict->addProfile(DESCARTES_DEFAULT_NAMESPACE, PROFILE, createDescartesSolverProfile<float>());
 
       // Min length
@@ -699,7 +727,7 @@ private:
     }
 
     auto task_data = std::make_shared<tesseract_planning::TaskComposerDataStorage>();
-    task_data->setData("input_program", program);
+    task_data->setData(task->getInputKeys().get("program"), program);
     task_data->setData("environment", std::shared_ptr<const tesseract_environment::Environment>(env_));
     task_data->setData("profiles", profile_dict);
 
@@ -753,7 +781,35 @@ private:
 
     // Check for successful plan
     if (!result->context->isSuccessful() || result->context->isAborted())
-      throw std::runtime_error("Failed to create motion plan");
+    {
+      std::string details;
+      const auto info_map = result->context->task_infos.getInfoMap();
+      for (const auto& entry : info_map)
+      {
+        const auto& info = entry.second;
+        if (info.return_value != 0 || info.isAborted() || info.status_message.empty() ||
+            info.name == "ErrorTask")
+          continue;
+        // A rejected primary solver is expected when it has a recovery edge.
+        // Report the terminal failure, not a solver whose fallback was skipped
+        // because an unrelated raster already aborted the graph.
+        if (info.conditional && !info.outbound_edges.empty())
+        {
+          const auto fallback = info_map.find(info.outbound_edges.front());
+          if (fallback != info_map.end() && !fallback->second.triggers_abort)
+            continue;
+        }
+        std::string description;
+        if (info.input_keys.has("program"))
+        {
+          const auto input = result->context->data_storage->getData(info.input_keys.get("program"));
+          if (input.getType() == std::type_index(typeid(tesseract_planning::CompositeInstruction)))
+            description = " (" + input.as<tesseract_planning::CompositeInstruction>().getDescription() + ")";
+        }
+        details += " [" + info.name + description + ": " + info.status_message + "]";
+      }
+      throw std::runtime_error("Failed to create motion plan" + details);
+    }
 
     // Get results of successful plan
     tesseract_planning::CompositeInstruction program_results =

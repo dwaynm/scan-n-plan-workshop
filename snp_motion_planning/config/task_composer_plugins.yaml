@@ -75,6 +75,25 @@ task_composer_plugins:
                   program: trajopt_output
                   environment: environment
                   profiles: profiles
+            ValidateRasterSeedTask:
+              class: ValidateRasterSeedTaskFactory
+              config:
+                conditional: true
+                inputs:
+                  program: min_length_output
+                  environment: environment
+                  profiles: profiles
+                outputs:
+                  program: trajopt_output
+            CheckSeedContactTask:
+              class: DiscreteContactCheckTaskFactory
+              config:
+                namespace: DiscreteContactCheckTask
+                conditional: true
+                inputs:
+                  program: trajopt_output
+                  environment: environment
+                  profiles: profiles
             ConstantTCPSpeedTimeParameterizationTask:
               class: ConstantTCPSpeedTimeParameterizationTaskFactory
               config:
@@ -90,8 +109,12 @@ task_composer_plugins:
             - source: MinLengthTask
               destinations: [ErrorTask, TrajOptMotionPlannerTask]
             - source: TrajOptMotionPlannerTask
-              destinations: [ErrorTask, DiscreteContactCheckTask]
+              destinations: [ValidateRasterSeedTask, DiscreteContactCheckTask]
             - source: DiscreteContactCheckTask
+              destinations: [ValidateRasterSeedTask, ConstantTCPSpeedTimeParameterizationTask]
+            - source: ValidateRasterSeedTask
+              destinations: [ErrorTask, CheckSeedContactTask]
+            - source: CheckSeedContactTask
               destinations: [ErrorTask, ConstantTCPSpeedTimeParameterizationTask]
             - source: ConstantTCPSpeedTimeParameterizationTask
               destinations: [ErrorTask, KinematicLimitsCheckTask]
@@ -101,13 +124,25 @@ task_composer_plugins:
       SNPFreespacePipeline:
         class: GraphTaskFactory
         config:
+          # RasterMotionTask writes updated raster endpoints to the child
+          # output key. The child must read that same key, not its stale seed.
           inputs:
-            program: input_program
+            program: output_program
           outputs:
             program: output_program
           nodes:
             DoneTask: *done
             ErrorTask: *error
+            PinFreespaceEndpointsTask:
+              class: PinFreespaceEndpointsTaskFactory
+              config:
+                conditional: true
+                inputs:
+                  program: output_program
+                  environment: environment
+                  profiles: profiles
+                outputs:
+                  program: input_program
             MinLengthTask: *min_length
             TrajOptMotionPlannerTask:
               class: TrajOptMotionPlannerTaskFactory
@@ -208,7 +243,16 @@ task_composer_plugins:
                 outputs:
                   program: output_program
             KinematicLimitsCheckTask: *limits_check
+            CheckFreespaceEndpointsTask:
+              class: CheckFreespaceEndpointsTaskFactory
+              config:
+                conditional: true
+                inputs:
+                  program: output_program
+                  reference: input_program
           edges:
+            - source: PinFreespaceEndpointsTask
+              destinations: [ErrorTask, MinLengthTask]
             - source: MinLengthTask
               destinations: [ErrorTask, TrajOptMotionPlannerTask]
             - source: TrajOptMotionPlannerTask
@@ -232,6 +276,8 @@ task_composer_plugins:
             - source: IterativeSplineParameterizationTask
               destinations: [ErrorTask, KinematicLimitsCheckTask]
             - source: KinematicLimitsCheckTask
+              destinations: [ErrorTask, CheckFreespaceEndpointsTask]
+            - source: CheckFreespaceEndpointsTask
               destinations: [ErrorTask, DoneTask]
           terminals: [ErrorTask, DoneTask]
       SNPPipeline:
@@ -265,7 +311,7 @@ task_composer_plugins:
                   program: simple_output
                 format_result_as_input: true
             DescartesMotionPlannerTask:
-              class: DescartesFMotionPlannerTaskFactory
+              class: CheckedDescartesTaskFactory
               config:
                 conditional: true
                 inputs:
