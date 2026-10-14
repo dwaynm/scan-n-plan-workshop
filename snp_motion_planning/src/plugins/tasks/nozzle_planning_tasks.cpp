@@ -1,5 +1,8 @@
 // SNP-specific seed validation and freespace endpoint handling.
 #include "../../level_axis_profile.h"
+#include "../../connected_raster_seed.h"
+#include <chrono>
+#include <sstream>
 #include <tesseract_command_language/composite_instruction.h>
 #include <tesseract_command_language/cartesian_waypoint.h>
 #include <tesseract_command_language/joint_waypoint.h>
@@ -151,6 +154,116 @@ protected:
     collision_config.type = tesseract_collision::CollisionEvaluatorType::LVS_DISCRETE;
     collision_config.longest_valid_segment_length = std::min(collision_config.longest_valid_segment_length, M_PI/180.0);
     DescartesCollisionEdgeEvaluator<float> check(*env, manip, collision_config, false);
+    if (profile->follow_seed)
+    {
+      const auto started = std::chrono::steady_clock::now();
+      const auto mi = program.getManipulatorInfo();
+      const auto cart = getProfile<TrajOptDefaultPlanProfile>("TrajOptMotionPlannerTask",
+          program.getProfile("TrajOptMotionPlannerTask"), *profiles);
+      if (!cart || !cart->cartesian_constraint_config.enabled ||
+          !cart->cartesian_constraint_config.use_tolerance_override)
+        throw std::runtime_error("Connected raster requires explicit Cartesian tolerances");
+      const auto& cfg = cart->cartesian_constraint_config;
+      const Eigen::VectorXd tolerance = cfg.upper_tolerance.cwiseMin(-cfg.lower_tolerance);
+      auto check_deadline = [&]() {
+        if (context.isAborted() || std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()
+                > profile->follow_seed_timeout)
+          throw std::runtime_error("Connected raster seed deadline exceeded; worker stopped");
+      };
+      ConnectedRasterIK solver(manip, mi.working_frame, mi.tcp_frame, env->findTCPOffset(mi),
+                               seed_limits, tolerance, check_deadline, cfg.coeff[5] > 0);
+      std::optional<Eigen::Isometry3d> previous;
+      refineRaster(program, profile->retry_spacing, previous);
+      Eigen::VectorXd q = anchor;
+      Eigen::Vector3d angular_hint = Eigen::Vector3d::Zero();
+      std::size_t index = 0;
+      std::size_t recovered = 0;
+      for (auto& instruction : program.flatten(&moveFilter))
+      {
+        check_deadline();
+        auto& move = instruction.get().as<MoveInstructionPoly>();
+        if (!move.getWaypoint().isCartesianWaypoint()) continue;
+        auto& waypoint = move.getWaypoint().as<CartesianWaypointPoly>();
+        const auto target = waypoint.getTransform();
+        bool accepted = false;
+        std::ostringstream failures;
+        // Try a few poses strictly inside the existing angular tolerance when
+        // the nominal solution contacts the robot. Retain a successful offset
+        // on the following samples for continuity, but validate every solution
+        // against the ORIGINAL waypoint, including the original joint limits.
+        std::vector<Eigen::Vector3d> trials(3, angular_hint);
+        if (angular_hint.norm() > 1e-9) trials.push_back(Eigen::Vector3d::Zero());
+        const Eigen::Vector3d angular_step = 0.8 * tolerance.tail<3>().cwiseMin(0.1);
+        for (int axis = 0; axis < 3; ++axis)
+          for (double sign : {-1.0, 1.0})
+          {
+            Eigen::Vector3d offset = Eigen::Vector3d::Zero();
+            offset[axis] = sign * angular_step[axis];
+            trials.push_back(offset);
+          }
+        for (double x : {-1.0, 1.0})
+          for (double y : {-1.0, 1.0})
+            trials.emplace_back(x*angular_step[0], y*angular_step[1], 0.0);
+        for (std::size_t attempt = 0; attempt < trials.size() && !accepted; ++attempt)
+        {
+          Eigen::VectorXd seed = q;
+          // Preserve the elbow branch near a straight arm. Alternate wrist
+          // seeds are bounded by the original physical/connected joint limits.
+          if (seed.size() == 6)
+          {
+            if (std::abs(seed[2]) < 0.01) seed[2] = anchor[2] < 0 ? -0.01 : 0.01;
+            if (attempt == 1) seed[5] += M_PI;
+            if (attempt == 2) seed[5] -= M_PI;
+          }
+          Eigen::Isometry3d trial_target = target;
+          const double angle = trials[attempt].norm();
+          if (angle > 1e-9)
+            trial_target.linear() *= Eigen::AngleAxisd(angle, trials[attempt]/angle).toRotationMatrix();
+          const Eigen::VectorXd candidate = solver.solve(trial_target, seed);
+          if (!solver.valid(target, candidate))
+          {
+            failures << " attempt " << attempt << " pose error ["
+                     << tesseract_common::calcTransformError(target, solver.pose(candidate)).transpose()
+                     << "] q [" << candidate.transpose() << "]";
+            continue;
+          }
+          const auto a = candidate.cast<float>().eval();
+          if (!check.evaluate(descartes_light::State<float>(a), descartes_light::State<float>(a)).first)
+          {
+            failures << " attempt " << attempt << " collision q [" << candidate.transpose() << "]";
+            continue;
+          }
+          if (index && move.getMoveType() == MoveInstructionType::LINEAR &&
+              (candidate-q).cwiseAbs().maxCoeff() > std::min(profile->max_joint_step, 10.0*M_PI/180.0))
+          {
+            failures << " attempt " << attempt << " joint step " << (candidate-q).cwiseAbs().maxCoeff()*180.0/M_PI;
+            continue;
+          }
+          q = candidate;
+          angular_hint = trials[attempt];
+          if (angular_hint.norm() > 1e-9) ++recovered;
+          accepted = true;
+        }
+        if (!accepted)
+        {
+          info.status_message = "Connected raster could not continue within existing pose/joint/collision limits at point "
+              + std::to_string(index) + "; no shortened rows accepted. " + failures.str();
+          info.color = "red";
+          CONSOLE_BRIDGE_logError("%s", info.status_message.c_str());
+          return info;
+        }
+        waypoint.setSeed(tesseract_common::JointState(manip->getJointNames(), q));
+        ++index;
+      }
+      setData(*context.data_storage, "program", program);
+      info.return_value = info.status_code = 1;
+      info.color = "green";
+      info.status_message = "Connected raster seeded " + std::to_string(index) + " Cartesian points; "
+          + std::to_string(recovered) + " used existing angular tolerance";
+      CONSOLE_BRIDGE_logInform("%s in %.3f s; interpolated validation follows", info.status_message.c_str(),
+          std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count());
+      return info;
+    }
     DescartesMotionPlanner<float> planner(ns);
     // Preserve the global nominal search when it works. If it fails, recover
     // individual rasters: free transfers will be solved after raster optimization
@@ -315,6 +428,8 @@ protected:
     std::size_t samples = 0;
     for (std::size_t i = 0; i < moves.size(); ++i)
     {
+      if (context.isAborted())
+        throw std::runtime_error("Raster validation cancelled");
       auto& move = moves[i].get().as<MoveInstructionPoly>();
       if (!move.getWaypoint().isCartesianWaypoint() || (i && move.getMoveType() != MoveInstructionType::LINEAR))
         throw std::runtime_error("Raster seed validation requires Cartesian LINEAR passes");
@@ -326,7 +441,9 @@ protected:
       if (!collision.evaluate(descartes_light::State<double>(start), descartes_light::State<double>(q)).first)
       { info.status_message = "Raster seed has an interpolated collision"; return info; }
       const int steps = std::max(1, static_cast<int>(std::ceil((q-start).norm()/(M_PI/180.0))));
-      for (int j = 0; j <= steps; ++j)
+      // The preceding endpoint was already checked against exactly the same
+      // target and joint state. Check each new interpolation sample once.
+      for (int j = 1; j <= steps; ++j)
       {
         const double f = static_cast<double>(j)/steps;
         Eigen::Isometry3d desired = target;
@@ -335,8 +452,8 @@ protected:
           desired.translation() = (1-f)*previous_target.translation() + f*target.translation();
           desired.linear() = Eigen::Quaterniond(previous_target.linear()).slerp(f, Eigen::Quaterniond(target.linear())).toRotationMatrix();
         }
-        const auto state = env->getState(names, start + f*(q-start));
-        const auto actual = state.link_transforms.at(mi.working_frame).inverse() * state.link_transforms.at(mi.tcp_frame) * tcp;
+        const auto transforms = kin->calcFwdKin(start + f*(q-start));
+        const auto actual = transforms.at(mi.working_frame).inverse() * transforms.at(mi.tcp_frame) * tcp;
         const auto error = tesseract_common::calcTransformError(desired, actual);
         for (Eigen::Index k = 0; k < 6; ++k)
           if (tolerance.coeff[k] > 0 &&
@@ -359,6 +476,33 @@ protected:
   template <class Archive> void serialize(Archive& ar, const unsigned int)
   { ar& BOOST_SERIALIZATION_BASE_OBJECT_NVP(PinFreespaceEndpointsTask); }
 };
+
+// Only the opt-in continuation route prefers its already validated seed.
+// Other surface types retain the existing optimizer-first behavior.
+class PreferRasterSeedTask : public ValidateRasterSeedTask
+{
+public:
+  PreferRasterSeedTask() = default;
+  using ValidateRasterSeedTask::ValidateRasterSeedTask;
+protected:
+  TaskComposerNodeInfo runImpl(TaskComposerContext& context, OptionalTaskComposerExecutor executor) const override
+  {
+    const auto program = getData(*context.data_storage, "program").as<CompositeInstruction>();
+    const auto profiles = getData(*context.data_storage, "profiles").as<std::shared_ptr<ProfileDictionary>>();
+    const auto profile = std::dynamic_pointer_cast<const LevelAxisDescartesPlanProfile<float>>(
+        profiles->getProfile(DescartesPlanProfile<float>::getStaticKey(), "DescartesMotionPlannerTask",
+                             program.getProfile("DescartesMotionPlannerTask")));
+    if (profile && profile->follow_seed) return ValidateRasterSeedTask::runImpl(context, executor);
+    TaskComposerNodeInfo info(*this);
+    info.return_value = info.status_code = 0;
+    info.status_message = "Continuation disabled; use normal optimization";
+    return info;
+  }
+  friend class boost::serialization::access;
+  template <class Archive> void serialize(Archive& ar, const unsigned int)
+  { ar& BOOST_SERIALIZATION_BASE_OBJECT_NVP(ValidateRasterSeedTask); }
+};
+using PreferRasterSeedTaskFactory = TaskComposerTaskFactory<PreferRasterSeedTask>;
 
 // Assert after both TrajOpt and OMPL routes, before the transfer is assembled
 // with neighboring rasters. Never accept a successful solver with shifted ends.
@@ -403,6 +547,83 @@ protected:
   template <class Archive> void serialize(Archive& ar, const unsigned int)
   { ar& BOOST_SERIALIZATION_BASE_OBJECT_NVP(TaskComposerTask); }
 };
+// A straight joint-space home leg needs no optimization when its whole edge
+// is already collision-free. Retain the ordinary planner as the fallback and
+// keep timing, joint-limit and exact-endpoint checks after this optional route.
+class PreferDirectFreespaceTask : public PinFreespaceEndpointsTask
+{
+public:
+  PreferDirectFreespaceTask() = default;
+  using PinFreespaceEndpointsTask::PinFreespaceEndpointsTask;
+protected:
+  TaskComposerNodeInfo runImpl(TaskComposerContext& context, OptionalTaskComposerExecutor) const override
+  {
+    TaskComposerNodeInfo info(*this);
+    info.return_value = info.status_code = 0;
+    auto program = getData(*context.data_storage, "program").as<CompositeInstruction>();
+    auto profiles = getData(*context.data_storage, "profiles").as<std::shared_ptr<ProfileDictionary>>();
+    const auto profile = std::dynamic_pointer_cast<const LevelAxisDescartesPlanProfile<float>>(
+        profiles->getProfile(DescartesPlanProfile<float>::getStaticKey(), "DescartesMotionPlannerTask",
+                            program.getProfile("DescartesMotionPlannerTask")));
+    if (!profile || !profile->follow_seed)
+    { info.status_message = "Direct freespace route disabled"; return info; }
+    if (program.size() < 2 || !program.front().isMoveInstruction() || !program.back().isMoveInstruction())
+    { info.status_message = "Direct freespace requires two endpoints"; return info; }
+    // SimpleMotionPlanner inserts unconstrained child joint waypoints before
+    // the terminal move. They are a seed, not required intermediate targets.
+    // Preserve every actual intermediate constraint by using the ordinary route.
+    for (std::size_t i = 1; i+1 < program.size(); ++i)
+    {
+      if (!program[i].isMoveInstruction()) return info;
+      const auto& move = program[i].as<MoveInstructionPoly>();
+      if (!move.getWaypoint().isJointWaypoint() || move.getWaypoint().as<JointWaypointPoly>().isConstrained() ||
+          move.getMoveType() != MoveInstructionType::FREESPACE ||
+          move.getParentUUID() != program.getLastMoveInstruction()->getUUID())
+      { info.status_message = "Intermediate freespace constraint retained for ordinary planner"; return info; }
+    }
+    auto env = getData(*context.data_storage, "environment").as<std::shared_ptr<const tesseract_environment::Environment>>();
+    const auto kin = env->getJointGroup(program.getManipulatorInfo().manipulator);
+    const auto names = kin->getJointNames();
+    const auto limits = kin->getLimits().joint_limits;
+    const auto start = getJointPosition(names, program.getFirstMoveInstruction()->getWaypoint());
+    const auto end = getJointPosition(names, program.getLastMoveInstruction()->getWaypoint());
+    for (const auto& q : {start, end})
+      if (!q.allFinite() || (q.array() < limits.col(0).array()).any() || (q.array() > limits.col(1).array()).any())
+        return info;
+    const auto contact = getProfile<ContactCheckProfile>("DiscreteContactCheckTask",
+        program.getProfile("DiscreteContactCheckTask"), *profiles);
+    if (!contact) return info;
+    auto config = contact->config;
+    config.type = tesseract_collision::CollisionEvaluatorType::LVS_DISCRETE;
+    config.longest_valid_segment_length = std::min(config.longest_valid_segment_length, M_PI/180.0);
+    DescartesCollisionEdgeEvaluator<double> collision(*env, kin, config, false);
+    if (context.isAborted()) throw std::runtime_error("Direct freespace validation cancelled");
+    if (!collision.evaluate(descartes_light::State<double>(start), descartes_light::State<double>(end)).first)
+    { info.status_message = "Direct freespace edge collides; ordinary planner required"; return info; }
+    const auto first = *program.getFirstMoveInstruction();
+    const auto last = *program.getLastMoveInstruction();
+    const int steps = std::max(1, static_cast<int>(std::ceil((end-start).norm()/(M_PI/180.0))));
+    program.clear();
+    auto initial = first;
+    initial.getWaypoint() = StateWaypoint(names, start);
+    program.push_back(initial);
+    for (int i = 1; i <= steps; ++i)
+    {
+      auto move = i == steps ? last : last.createChild();
+      move.getWaypoint() = StateWaypoint(names, start + (end-start)*(static_cast<double>(i)/steps));
+      program.push_back(move);
+    }
+    setData(*context.data_storage, "program", program);
+    info.return_value = info.status_code = 1;
+    info.color = "green";
+    info.status_message = "Validated direct freespace edge; timing and endpoint checks follow";
+    return info;
+  }
+  friend class boost::serialization::access;
+  template <class Archive> void serialize(Archive& ar, const unsigned int)
+  { ar& BOOST_SERIALIZATION_BASE_OBJECT_NVP(PinFreespaceEndpointsTask); }
+};
+using PreferDirectFreespaceTaskFactory = TaskComposerTaskFactory<PreferDirectFreespaceTask>;
 using ValidateRasterSeedTaskFactory = TaskComposerTaskFactory<ValidateRasterSeedTask>;
 using CheckFreespaceEndpointsTaskFactory = TaskComposerTaskFactory<CheckFreespaceEndpointsTask>;
 using PinFreespaceEndpointsTaskFactory = TaskComposerTaskFactory<PinFreespaceEndpointsTask>;
@@ -422,3 +643,11 @@ TESSERACT_ADD_TASK_COMPOSER_NODE_PLUGIN(snp_motion_planning::CheckFreespaceEndpo
 TESSERACT_SERIALIZE_ARCHIVES_INSTANTIATE(snp_motion_planning::ValidateRasterSeedTask)
 BOOST_CLASS_EXPORT_IMPLEMENT(snp_motion_planning::ValidateRasterSeedTask)
 TESSERACT_ADD_TASK_COMPOSER_NODE_PLUGIN(snp_motion_planning::ValidateRasterSeedTaskFactory, ValidateRasterSeedTaskFactory)
+
+TESSERACT_SERIALIZE_ARCHIVES_INSTANTIATE(snp_motion_planning::PreferRasterSeedTask)
+BOOST_CLASS_EXPORT_IMPLEMENT(snp_motion_planning::PreferRasterSeedTask)
+TESSERACT_ADD_TASK_COMPOSER_NODE_PLUGIN(snp_motion_planning::PreferRasterSeedTaskFactory, PreferRasterSeedTaskFactory)
+
+TESSERACT_SERIALIZE_ARCHIVES_INSTANTIATE(snp_motion_planning::PreferDirectFreespaceTask)
+BOOST_CLASS_EXPORT_IMPLEMENT(snp_motion_planning::PreferDirectFreespaceTask)
+TESSERACT_ADD_TASK_COMPOSER_NODE_PLUGIN(snp_motion_planning::PreferDirectFreespaceTaskFactory, PreferDirectFreespaceTaskFactory)

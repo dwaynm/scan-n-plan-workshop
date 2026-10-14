@@ -197,6 +197,8 @@ public:
   double level_weight{ 0.0 };                    //!< 0 disables and restores stock behaviour
   double max_joint_step{ 0.0 };                  //!< rad, per joint per edge; 0 disables
 
+  bool follow_seed{false};
+  double follow_seed_timeout{35.0};
   int seed_attempts{3};
   double retry_spacing{0.015};
   double retry_roll_resolution{2.5 * M_PI / 180.0};
@@ -305,5 +307,5 @@ BOOST_CLASS_EXPORT_KEY(snp_motion_planning::LevelAxisDescartesPlanProfile<float>
 BOOST_CLASS_EXPORT_KEY(snp_motion_planning::LevelAxisDescartesPlanProfile<double>)
 
 #include <boost/serialization/version.hpp>
-BOOST_CLASS_VERSION(snp_motion_planning::LevelAxisDescartesPlanProfile<float>, 2)
-BOOST_CLASS_VERSION(snp_motion_planning::LevelAxisDescartesPlanProfile<double>, 2)
+BOOST_CLASS_VERSION(snp_motion_planning::LevelAxisDescartesPlanProfile<float>, 3)
+BOOST_CLASS_VERSION(snp_motion_planning::LevelAxisDescartesPlanProfile<double>, 3)

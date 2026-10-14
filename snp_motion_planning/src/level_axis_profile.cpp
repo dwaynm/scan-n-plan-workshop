@@ -26,6 +26,11 @@ void LevelAxisDescartesPlanProfile<FloatType>::serialize(Archive& ar, const unsi
     ar& BOOST_SERIALIZATION_NVP(retry_spacing);
     ar& BOOST_SERIALIZATION_NVP(retry_roll_resolution);
   }
+  if (version > 2)
+  {
+    ar& BOOST_SERIALIZATION_NVP(follow_seed);
+    ar& BOOST_SERIALIZATION_NVP(follow_seed_timeout);
+  }
   if (version > 1)
   {
     ar& BOOST_SERIALIZATION_NVP(seed_joint_bounds);

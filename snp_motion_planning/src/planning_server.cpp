@@ -323,6 +323,8 @@ public:
     declare_parameter<std::vector<double>>(LEVEL_AXIS_PARAM, { 0.0, 0.0, 1.0 });
     declare_parameter<double>(LEVEL_AXIS_WEIGHT_PARAM, 0.0);
     declare_parameter<double>("descartes_max_joint_step_deg", 30.0);
+    declare_parameter<bool>("vertical_flat_seed_following", false);
+    declare_parameter<double>("vertical_flat_seed_timeout", 35.0);
     declare_parameter<int>("descartes_seed_attempts", 3);
     declare_parameter<double>("descartes_retry_spacing", 0.015);
     declare_parameter<double>("descartes_retry_roll_resolution_deg", 2.5);
@@ -641,6 +643,10 @@ private:
           createDescartesPlanProfile<float>(static_cast<float>(min_contact_dist), collision_pairs,
               longest_valid_segment_length, tool_z_range, tool_z_resolution, level_link, level_axis, level_weight));
       seed_profile->max_joint_step = get<double>(this, "descartes_max_joint_step_deg") * M_PI / 180.0;
+      seed_profile->follow_seed = get<bool>(this, "vertical_flat_seed_following");
+      seed_profile->follow_seed_timeout = get<double>(this, "vertical_flat_seed_timeout");
+      if (!std::isfinite(seed_profile->follow_seed_timeout) || seed_profile->follow_seed_timeout <= 0 || seed_profile->follow_seed_timeout > 45)
+        throw std::runtime_error("Vertical flat seed timeout must be in (0, 45] seconds");
       seed_profile->seed_attempts = get<int>(this, "descartes_seed_attempts");
       seed_profile->retry_spacing = get<double>(this, "descartes_retry_spacing");
       seed_profile->retry_roll_resolution = get<double>(this, "descartes_retry_roll_resolution_deg") * M_PI / 180.0;

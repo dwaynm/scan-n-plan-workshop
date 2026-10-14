@@ -75,6 +75,16 @@ task_composer_plugins:
                   program: trajopt_output
                   environment: environment
                   profiles: profiles
+            PreferRasterSeedTask:
+              class: PreferRasterSeedTaskFactory
+              config:
+                conditional: true
+                inputs:
+                  program: min_length_output
+                  environment: environment
+                  profiles: profiles
+                outputs:
+                  program: trajopt_output
             ValidateRasterSeedTask:
               class: ValidateRasterSeedTaskFactory
               config:
@@ -107,7 +117,9 @@ task_composer_plugins:
             KinematicLimitsCheckTask: *limits_check
           edges:
             - source: MinLengthTask
-              destinations: [ErrorTask, TrajOptMotionPlannerTask]
+              destinations: [ErrorTask, PreferRasterSeedTask]
+            - source: PreferRasterSeedTask
+              destinations: [TrajOptMotionPlannerTask, CheckSeedContactTask]
             - source: TrajOptMotionPlannerTask
               destinations: [ValidateRasterSeedTask, DiscreteContactCheckTask]
             - source: DiscreteContactCheckTask
@@ -143,6 +155,16 @@ task_composer_plugins:
                   profiles: profiles
                 outputs:
                   program: input_program
+            PreferDirectFreespaceTask:
+              class: PreferDirectFreespaceTaskFactory
+              config:
+                conditional: true
+                inputs:
+                  program: input_program
+                  environment: environment
+                  profiles: profiles
+                outputs:
+                  program: output_program
             MinLengthTask: *min_length
             TrajOptMotionPlannerTask:
               class: TrajOptMotionPlannerTaskFactory
@@ -252,7 +274,9 @@ task_composer_plugins:
                   reference: input_program
           edges:
             - source: PinFreespaceEndpointsTask
-              destinations: [ErrorTask, MinLengthTask]
+              destinations: [ErrorTask, PreferDirectFreespaceTask]
+            - source: PreferDirectFreespaceTask
+              destinations: [MinLengthTask, IterativeSplineParameterizationTask]
             - source: MinLengthTask
               destinations: [ErrorTask, TrajOptMotionPlannerTask]
             - source: TrajOptMotionPlannerTask
