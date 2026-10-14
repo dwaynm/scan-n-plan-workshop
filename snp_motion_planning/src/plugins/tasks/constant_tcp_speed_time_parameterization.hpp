@@ -1,10 +1,12 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+#include <memory>
 #include <kdl/chainjnttojacdotsolver.hpp>
 #include <kdl/path_line.hpp>
 #include <kdl/path_composite.hpp>
 #include <kdl/rotational_interpolation_sa.hpp>
-#include <kdl/trajectory_segment.hpp>
 #include <kdl/velocityprofile_trap.hpp>
 #include <kdl/velocityprofile_traphalf.hpp>
 #include <kdl/utilities/error.h>
@@ -37,6 +39,18 @@ Eigen::VectorXd fromKDL(const KDL::Twist& k)
 
 namespace snp_motion_planning
 {
+inline double boundedTCPPathPosition(double position, double length)
+{
+  // KDL evaluates its deceleration polynomial even at Duration(). Roundoff
+  // can put its result just past PathLength(), whose Lookup asserts at 1e-12.
+  // Only correct sub-nanometre numerical overshoot; reject invalid profiles.
+  constexpr double roundoff = 1e-9;
+  if (!std::isfinite(position) || !std::isfinite(length) || length <= 0.0 ||
+      position < -roundoff || position > length + roundoff)
+    throw std::runtime_error("Constant TCP speed profile position is outside its path");
+  return std::clamp(position, 0.0, length);
+}
+
 class ConstantTCPSpeedTimeParameterization
 {
 public:
@@ -66,7 +80,9 @@ public:
   {
     try
     {
-      auto path = new KDL::Path_Composite();
+      if (trajectory.size() < 2)
+        throw std::runtime_error("Constant TCP speed requires at least two waypoints");
+      auto path = std::make_unique<KDL::Path_Composite>();
 
       // Create a container for the times of each waypoint in the newly parameterized trajectory
       std::vector<double> times;
@@ -75,8 +91,10 @@ public:
 
       const double max_vel = max_velocity_scaling_factor * max_translational_vel;
       const double max_acc = max_acceleration_scaling_factor * max_translational_acc;
+      if (!std::isfinite(max_vel) || !std::isfinite(max_acc) || max_vel <= 0.0 || max_acc <= 0.0)
+        throw std::runtime_error("Constant TCP speed requires positive finite velocity and acceleration");
       KDL::VelocityProfile_TrapHalf v_trap_half(max_vel, max_acc, true);
-      auto v_trap = new KDL::VelocityProfile_Trap(max_vel, max_acc);
+      auto v_trap = std::make_unique<KDL::VelocityProfile_Trap>(max_vel, max_acc);
 
       for (Eigen::Index i = 1; i < trajectory.size(); ++i)
       {
@@ -109,6 +127,8 @@ public:
 
       // Apply a double-ended trapezoidal velocity profile to the full path
       double path_length = path->PathLength();
+      if (!std::isfinite(path_length) || path_length <= 0.0)
+        throw std::runtime_error("Constant TCP speed requires a positive finite path length");
       v_trap->SetProfile(0.0, path_length);
       const double duration = v_trap->Duration();
 
@@ -156,11 +176,14 @@ public:
         double t = times[i];
 
         // Compute the joint velocity and acceleration
-        KDL::Trajectory_Segment traj(path, v_trap, false);
-        KDL::Twist vel = traj.Vel(t);
-        KDL::Twist acc = traj.Acc(t);
+        const double s = boundedTCPPathPosition(v_trap->Pos(t), path_length);
+        KDL::Twist vel = path->Vel(s, v_trap->Vel(t));
+        KDL::Twist acc = path->Acc(s, v_trap->Vel(t), v_trap->Acc(t));
         const Eigen::VectorXd joint_vel = computeJointVelocity(vel, joints);
         const Eigen::VectorXd joint_acc = computeJointAcceleration(acc, joints, joint_vel);
+        if (!std::isfinite(t) || t < 0.0 || t > duration ||
+            !joint_vel.allFinite() || !joint_acc.allFinite())
+          throw std::runtime_error("Constant TCP speed produced invalid timing data");
 
         // Update the trajectory container
         trajectory.setData(i, joint_vel, joint_acc, t);

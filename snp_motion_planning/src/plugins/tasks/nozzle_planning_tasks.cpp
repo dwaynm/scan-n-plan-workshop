@@ -191,7 +191,13 @@ protected:
         // the nominal solution contacts the robot. Retain a successful offset
         // on the following samples for continuity, but validate every solution
         // against the ORIGINAL waypoint, including the original joint limits.
-        std::vector<Eigen::Vector3d> trials(3, angular_hint);
+        // Free roll needs local wrist alternatives near a collision boundary.
+        // A 180-degree seed flip cannot satisfy the 10-degree continuity cap.
+        const std::vector<double> wrist_steps = cfg.coeff[5] == 0
+            ? std::vector<double>{0.0, 2*M_PI/180., -2*M_PI/180., 5*M_PI/180., -5*M_PI/180.,
+                                  9*M_PI/180., -9*M_PI/180., M_PI, -M_PI}
+            : std::vector<double>{0.0, M_PI, -M_PI};
+        std::vector<Eigen::Vector3d> trials(wrist_steps.size(), angular_hint);
         if (angular_hint.norm() > 1e-9) trials.push_back(Eigen::Vector3d::Zero());
         const Eigen::Vector3d angular_step = 0.8 * tolerance.tail<3>().cwiseMin(0.1);
         for (int axis = 0; axis < 3; ++axis)
@@ -212,8 +218,7 @@ protected:
           if (seed.size() == 6)
           {
             if (std::abs(seed[2]) < 0.01) seed[2] = anchor[2] < 0 ? -0.01 : 0.01;
-            if (attempt == 1) seed[5] += M_PI;
-            if (attempt == 2) seed[5] -= M_PI;
+            if (attempt < wrist_steps.size()) seed[5] += wrist_steps[attempt];
           }
           Eigen::Isometry3d trial_target = target;
           const double angle = trials[attempt].norm();
@@ -228,7 +233,9 @@ protected:
             continue;
           }
           const auto a = candidate.cast<float>().eval();
-          if (!check.evaluate(descartes_light::State<float>(a), descartes_light::State<float>(a)).first)
+          const auto from = (index && move.getMoveType() == MoveInstructionType::LINEAR)
+              ? q.cast<float>().eval() : a;
+          if (!check.evaluate(descartes_light::State<float>(from), descartes_light::State<float>(a)).first)
           {
             failures << " attempt " << attempt << " collision q [" << candidate.transpose() << "]";
             continue;
